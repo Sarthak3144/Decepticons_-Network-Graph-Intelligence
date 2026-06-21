@@ -1,7 +1,7 @@
 # Network Intelligence — AML Structural Pattern Detection
 
 **Track 3 — Network & Graph Intelligence**
-AI/ML Intelligence Hackathon · June 15–20, 2026
+AI/ML Intelligence Hackathon 
 
 Money laundering rarely shows up in a single transaction. It hides in the *shape* of money movement — one account quietly splitting funds across a dozen others, a chain of transfers passing value hand to hand, or a loop that brings money right back to where it started. This project models a banking transaction dataset as a directed graph and hunts for exactly those shapes: **fan-out/fan-in (smurfing)**, **layering chains**, and **circular flows** — then ranks the accounts involved and explains, in plain language, what structural evidence put them there.
 
