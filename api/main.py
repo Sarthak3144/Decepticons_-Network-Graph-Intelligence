@@ -1,161 +1,292 @@
-"""
-main.py
-Track 4 — Risk Scoring & Prioritization (API Service Layer)
-AI/ML Intelligence Hackathon, June 2026
-
-FastAPI backend application serving risk scores, complex topological graph intelligence,
-and real-time SHAP explanation factors to power the compliance dashboard interface.
-
-Run from api/: uvicorn main:app --reload --port 8000
-"""
-
-import os
-import sys
-import json
-import pandas as pd
-import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+import pandas as pd
+import sys
 
-# Ensure api directory can access src directory sibling modules
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
-SRC_DIR = os.path.join(PARENT_DIR, 'src')
+sys.path.append(str(Path(__file__).parent.parent / "src"))
 
-if PARENT_DIR not in sys.path:
-    sys.path.append(PARENT_DIR)
-if SRC_DIR not in sys.path:
-    sys.path.append(SRC_DIR)
+from graph_builder import load_edges, build_simple_graph, attach_account_attributes, get_graph_summary
+from pattern_fanout import detect_fanout, detect_fanin, find_fanout_fanin_chains
+from pattern_layering import detect_layering
+from pattern_cycles import detect_cycles
+from risk_ranker import run_full_pipeline, get_account_explanation
 
-from src.explainer import build_explainer, explain_account
-
-app = FastAPI(
-    title="Risk Prioritization Engine Engine API",
-    description="Compliance Triage Back-End Orchestrator for Track 3 & Track 4",
-    version="1.0.0"
-)
+app = FastAPI(title="Network Intelligence API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permits localhost:5173 to connect seamlessly
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global variables to act as memory cache storage for fast response metrics
-DB = {}
+OUTPUT_DIR = Path(__file__).parent.parent / "outputs"
+RANKED_CSV = OUTPUT_DIR / "network_intelligence_scores.csv"
+
+# Cache the ranked results and graph in memory at startup so each API call
+# doesn't re-run the full detection pipeline
+_state = {
+    "ranked_df": None,
+    "graph": None,
+}
+
 
 @app.on_event("startup")
-def startup_event():
-    """Initializes and caches heavy structural data tables and models into RAM at boot time."""
-    print("Booting Core Engine API - Preloading Models and Scoring Ledgers...")
-    try:
-        # 1. Load ML priority metrics
-        scores_path = "../outputs/account_risk_scores.csv"
-        if os.path.exists(scores_path):
-            DB["scores"] = pd.read_csv(scores_path)
-        else:
-            raise FileNotFoundError(f"Missing core scoring ledger artifact at {scores_path}")
-            
-        # 2. Load Network Graph metrics
-        net_path = "../outputs/network_intelligence_scores.csv"
-        if os.path.exists(net_path):
-            DB["network"] = pd.read_csv(net_path)
-        else:
-            DB["network"] = pd.DataFrame()
-            
-        # 3. Initialize prediction explanation objects
-        model = xgb.XGBClassifier()
-        model.load_model("../models/xgb_risk_model.json")
-        
-        with open("../models/feature_columns.json") as f:
-            feature_cols = json.load(f)
-            
-        from src.model import load_data, build_account_features
-        ml, accounts = load_data("../data")
-        feat = build_account_features(ml, accounts)
-        
-        DB["model"] = model
-        DB["feature_cols"] = feature_cols
-        DB["feat"] = feat
-        DB["explainer"] = build_explainer(model)
-        
-        print("Preloading sequence completed successfully. Systems operational.")
-    except Exception as e:
-        print(f"CRITICAL BOOT ERROR: {str(e)}")
+def load_or_compute_results():
+    if RANKED_CSV.exists():
+        print(f"Loading cached results from {RANKED_CSV}")
+        df = pd.read_csv(RANKED_CSV)
+        _state["ranked_df"] = df
+    else:
+        print("No cached results found, running full pipeline (this may take a few minutes)...")
+        _state["ranked_df"] = run_full_pipeline()
 
-@app.get("/api/triage/queue")
-def get_triage_queue(limit: int = 50):
-    """Returns the primary compliance queue ranked by risk score to power the master dashboard."""
-    if "scores" not in DB:
-        raise HTTPException(status_code=503, detail="Scoring engine ledger uninitialized.")
-    
-    merged = DB["scores"].copy()
-    if not DB["network"].empty:
-        merged = merged.merge(DB["network"][["account_id", "network_risk_score", "structural_explanation"]], on="account_id", how="left")
-        
-    df_sorted = merged.sort_values(by="risk_score", ascending=False).head(limit)
-    return df_sorted.fillna(0).to_dict(orient="records")
+    # Cache pattern detections too, so tabs load instantly instead of
+    # recomputing on every click
+    edges_df = load_edges()
 
-@app.get("/api/risk/{account_id}")
-def get_account_risk_profile(account_id: int):
-    """Returns granular details, network topology, and SHAP factors for a specific target account."""
-    if "feat" not in DB:
-        raise HTTPException(status_code=503, detail="Agnostic inference engine uninitialized.")
-        
-    try:
-        explanation = explain_account(
-            account_id=account_id,
-            model=DB["model"],
-            explainer=DB["explainer"],
-            feat=DB["feat"],
-            feature_cols=DB["feature_cols"]
-        )
-    except ValueError:
-        raise HTTPException(status_code=404, detail=f"Account configuration {account_id} not indexed.")
+    fanout_path = OUTPUT_DIR / "fanout_cache.csv"
+    fanin_path = OUTPUT_DIR / "fanin_cache.csv"
+    layering_path = OUTPUT_DIR / "layering_cache.csv"
+    cycles_path = OUTPUT_DIR / "cycles_cache.csv"
 
-    net_profile = {}
-    if not DB["network"].empty:
-        net_match = DB["network"][DB["network"]["account_id"] == account_id]
-        if not net_match.empty:
-            net_profile = net_match.iloc[0].to_dict()
+    if fanout_path.exists():
+        _state["fanout_df"] = pd.read_csv(fanout_path)
+    else:
+        print("Computing fan-out patterns...")
+        df = detect_fanout(edges_df)
+        df.to_csv(fanout_path, index=False)
+        _state["fanout_df"] = df
 
+    if layering_path.exists():
+        _state["layering_df"] = pd.read_csv(layering_path)
+    else:
+        print("Computing layering patterns (this is the slow one)...")
+        df = detect_layering(edges_df, candidate_limit=500)
+        df.to_csv(layering_path, index=False)
+        _state["layering_df"] = df
+
+    if cycles_path.exists():
+        _state["cycles_df"] = pd.read_csv(cycles_path)
+    else:
+        print("Computing cycle patterns...")
+        df = detect_cycles(edges_df, max_length=4, max_candidates=2000)
+        df.to_csv(cycles_path, index=False)
+        _state["cycles_df"] = df
+
+    print("Building graph for visualization endpoints...")
+    G = build_simple_graph(edges_df)
+    G = attach_account_attributes(G)
+    _state["graph"] = G
+
+    print("API ready.")
+
+
+@app.on_event("startup")
+def load_or_compute_results():
+    if RANKED_CSV.exists():
+        print(f"Loading cached results from {RANKED_CSV}")
+        df = pd.read_csv(RANKED_CSV)
+        # patterns_triggered was saved as a comma-joined string, keep as-is
+        _state["ranked_df"] = df
+    else:
+        print("No cached results found, running full pipeline (this may take a few minutes)...")
+        _state["ranked_df"] = run_full_pipeline()
+
+    print("Building graph for visualization endpoints...")
+    edges_df = load_edges()
+    G = build_simple_graph(edges_df)
+    G = attach_account_attributes(G)
+    _state["graph"] = G
+
+    print("API ready.")
+
+@app.get("/")
+def root():
     return {
-        "account_id": account_id,
-        "risk_score": explanation["risk_score"],
-        "is_suspicious_ground_truth": explanation["is_suspicious_account_label"],
-        "structural_risk_factors": explanation["top_factors"],
-        "network_intelligence": net_profile
+        "service": "Network Intelligence API",
+        "track": "Track 3 — Network & Graph Intelligence",
+        "endpoints": [
+            "/graph/summary",
+            "/graph/subgraph/{account_id}",
+            "/patterns/fanout",
+            "/patterns/fanin",
+            "/patterns/layering",
+            "/patterns/cycles",
+            "/accounts/ranked",
+            "/accounts/{account_id}/explanation",
+        ],
+    }    
+
+    
+    
+# @app.get("/patterns/layering")
+# def get_layering_patterns(limit: int = 20, candidate_limit: int = 500):
+#     edges_df = load_edges()
+#     df = detect_layering(edges_df, candidate_limit=candidate_limit)
+#     df = df.head(limit).copy()
+
+#     df["start_time"] = df["start_time"].astype(str)
+#     df["end_time"] = df["end_time"].astype(str)
+
+#     # Cast numpy types to native Python types so FastAPI's jsonable_encoder
+#     # can serialize them — numpy.int64 inside lists/scalars fails silently
+#     # with a cryptic "not iterable" error otherwise
+#     df["origin"] = df["origin"].apply(lambda x: int(x))
+#     df["chain_accounts"] = df["chain_accounts"].apply(lambda lst: [int(a) for a in lst])
+#     df["hop_count"] = df["hop_count"].apply(lambda x: int(x))
+#     df["start_amount"] = df["start_amount"].apply(lambda x: float(x))
+#     df["end_amount"] = df["end_amount"].apply(lambda x: float(x))
+#     df["amount_retained_pct"] = df["amount_retained_pct"].apply(lambda x: float(x))
+#     df["duration_hours"] = df["duration_hours"].apply(lambda x: float(x))
+
+#     return df.to_dict(orient="records")
+
+
+    
+
+
+@app.get("/graph/summary")
+def graph_summary():
+    G = _state["graph"]
+    if G is None:
+        raise HTTPException(status_code=503, detail="Graph not yet loaded")
+    return get_graph_summary(G)
+
+
+@app.get("/graph/subgraph/{account_id}")
+def get_subgraph(account_id: int, hops: int = 2):
+    """
+    Returns a local subgraph around an account — its neighbors up to N hops
+    in both directions. Used by the frontend to render a focused visualization
+    instead of the entire 65k-node graph.
+    """
+    G = _state["graph"]
+    if account_id not in G:
+        raise HTTPException(status_code=404, detail=f"Account {account_id} not found in graph")
+
+    nodes_in_scope = {account_id}
+    frontier = {account_id}
+
+    for _ in range(hops):
+        next_frontier = set()
+        for node in frontier:
+            next_frontier.update(G.predecessors(node))
+            next_frontier.update(G.successors(node))
+        nodes_in_scope.update(next_frontier)
+        frontier = next_frontier
+
+    subgraph = G.subgraph(nodes_in_scope)
+
+    nodes_payload = [
+        {
+            "id": n,
+            "risk_grade": subgraph.nodes[n].get("risk_grade"),
+            "pep_flag": subgraph.nodes[n].get("pep_flag"),
+            "sanctions_hit": subgraph.nodes[n].get("sanctions_hit"),
+            "is_center": n == account_id,
+        }
+        for n in subgraph.nodes
+    ]
+
+    edges_payload = [
+        {
+            "source": u,
+            "target": v,
+            "total_amount": data.get("total_amount"),
+            "tx_count": data.get("tx_count"),
+        }
+        for u, v, data in subgraph.edges(data=True)
+    ]
+
+    return {"center": account_id, "nodes": nodes_payload, "edges": edges_payload}
+
+
+@app.get("/patterns/fanout")
+def get_fanout_patterns(limit: int = 20):
+    df = _state.get("fanout_df")
+    if df is None or df.empty:
+        return []
+    return df.head(limit).to_dict(orient="records")
+
+
+@app.get("/patterns/layering")
+def get_layering_patterns(limit: int = 20, candidate_limit: int = 500):
+    edges_df = load_edges()
+    df = detect_layering(edges_df, candidate_limit=candidate_limit)
+    df = df.head(limit).copy()
+    df["start_time"] = df["start_time"].astype(str)
+    df["end_time"] = df["end_time"].astype(str)
+    return df.to_dict(orient="records")
+
+
+@app.get("/patterns/cycles")
+def get_cycle_patterns(limit: int = 20):
+    edges_df = load_edges()
+    df = detect_cycles(edges_df, max_length=4, max_candidates=2000)
+    df = df.head(limit).copy()
+    df["start_time"] = df["start_time"].astype(str)
+    df["end_time"] = df["end_time"].astype(str)
+    return df.to_dict(orient="records")
+
+
+@app.get("/patterns/fanin")
+def get_fanin_patterns(limit: int = 20):
+    edges_df = load_edges()
+    df = detect_fanin(edges_df)
+    df = df.head(limit).copy()
+    df["window_start"] = df["window_start"].astype(str)
+    df["window_end"] = df["window_end"].astype(str)
+    return df.to_dict(orient="records")
+
+
+# @app.get("/patterns/cycles")
+# def get_cycle_patterns(limit: int = 20):
+#     edges_df = load_edges()
+#     df = detect_cycles(edges_df, max_length=4, max_candidates=2000)
+#     df = df.head(limit).copy()
+
+#     df["start_time"] = df["start_time"].astype(str)
+#     df["end_time"] = df["end_time"].astype(str)
+#     df["cycle_accounts"] = df["cycle_accounts"].apply(lambda lst: [int(a) for a in lst])
+#     df["cycle_length"] = df["cycle_length"].apply(lambda x: int(x))
+#     df["start_amount"] = df["start_amount"].apply(lambda x: float(x))
+#     df["end_amount"] = df["end_amount"].apply(lambda x: float(x))
+#     df["amount_retained_pct"] = df["amount_retained_pct"].apply(lambda x: float(x))
+#     df["duration_hours"] = df["duration_hours"].apply(lambda x: float(x))
+
+#     return df.to_dict(orient="records")
+
+
+@app.get("/accounts/ranked")
+def get_ranked_accounts(limit: int = 50, offset: int = 0):
+    df = _state["ranked_df"]
+    if df is None or df.empty:
+        return {"total": 0, "results": []}
+
+    page = df.iloc[offset: offset + limit]
+    return {
+        "total": len(df),
+        "limit": limit,
+        "offset": offset,
+        "results": page.to_dict(orient="records"),
     }
 
-@app.get("/api/graph/topology")
-def get_graph_topology(limit: int = 100):
-    """Returns the nodes and edges required to render an interactive network visual canvas."""
-    # Reference the local global DB context safely
-    if "feat" not in DB:
-        raise HTTPException(status_code=503, detail="Data layers uninitialized.")
-        
-    csv_path = "../data/ml_features.csv"
-    if not os.path.exists(csv_path):
-        raise HTTPException(status_code=404, detail="Transaction ledger file not found.")
 
-    ml_data = pd.read_csv(csv_path).head(limit)
-    
-    nodes = set(ml_data["Sender_account"].unique()).union(set(ml_data["Receiver_account"].unique()))
-    
-    nodes_list = [{"id": int(n), "label": f"Acc {n}"} for n in nodes]
-    links_list = [
-        {
-            "source": int(row["Sender_account"]), 
-            "target": int(row["Receiver_account"]), 
-            "val": float(row["amount_local_npr"])
-        } for _, row in ml_data.iterrows()
-    ]
-    
-    return {"nodes": nodes_list, "links": links_list}
+@app.get("/accounts/{account_id}/explanation")
+def get_explanation(account_id: int):
+    df = _state["ranked_df"]
+    if df is None:
+        raise HTTPException(status_code=503, detail="Results not yet loaded")
 
-@app.get("/api/health")
-def health_check():
-    """System heartbeat verification ping."""
-    return {"status": "healthy", "cached_keys": list(DB.keys())}
+    result = get_account_explanation(account_id, df)
+    if not result["found"]:
+        return result
+
+    return result
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

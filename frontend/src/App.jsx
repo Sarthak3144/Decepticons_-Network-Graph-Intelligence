@@ -1,27 +1,77 @@
-import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
-import RiskDashboard from './components/RiskDashboard';
-import NetworkGraphView from './components/NetworkGraphView';
+import { useEffect, useState } from "react";
+import { api } from "./api/client";
+import GraphCanvas from "./components/GraphCanvas";
+import SearchBar from "./components/SearchBar";
+import ExplanationPanel from "./components/ExplanationPanel";
+import RankedTable from "./components/RankedTable";
+import PatternTabs from "./components/PatternTabs";
 
-function App() {
+export default function App() {
+  const [summary, setSummary] = useState(null);
+  const [accountId, setAccountId] = useState(null);
+  const [subgraph, setSubgraph] = useState(null);
+  const [explanation, setExplanation] = useState(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [explLoading, setExplLoading] = useState(false);
+  const [ranked, setRanked] = useState([]);
+
+  useEffect(() => {
+    api.graphSummary().then(setSummary).catch(() => {});
+    api.rankedAccounts(50, 0).then((r) => setRanked(r.results)).catch(() => {});
+  }, []);
+
+  function handleSearch(id) {
+    const numId = Number(id);
+    setAccountId(numId);
+    setGraphLoading(true);
+    setExplLoading(true);
+
+    api.subgraph(numId, 1)
+      .then(setSubgraph)
+      .catch(() => setSubgraph(null))
+      .finally(() => setGraphLoading(false));
+
+    api.explanation(numId)
+      .then(setExplanation)
+      .catch(() => setExplanation(null))
+      .finally(() => setExplLoading(false));
+  }
+
   return (
-    <Router>
-      {/* Global Navigation Toggle bar */}
-      <div className="absolute bottom-6 right-6 z-50 flex gap-2 bg-slate-900/80 border border-slate-800 p-1.5 rounded-lg backdrop-blur">
-        <Link to="/" className="px-3 py-1.5 rounded font-mono text-xs text-slate-300 hover:bg-slate-800 transition">
-          📋 Dashboard
-        </Link>
-        <Link to="/topology" className="px-3 py-1.5 rounded font-mono text-xs text-sky-400 bg-slate-800 border border-slate-700 transition">
-          🌐 Global Topology Map
-        </Link>
+    <div className="app">
+      <header className="app-header">
+        <div>
+          <h1 className="mono">NETWORK INTELLIGENCE</h1>
+          <p className="dim small">Track 3 — structural laundering pattern detection</p>
+        </div>
+        {summary && (
+          <div className="header-stats mono small dim">
+            <span>{summary.num_nodes.toLocaleString()} accounts</span>
+            <span>{summary.num_edges.toLocaleString()} edges</span>
+          </div>
+        )}
+      </header>
+
+      <div className="hero-row">
+        <div className="hero-main">
+          <SearchBar onSearch={handleSearch} defaultValue={accountId || ""} />
+          <GraphCanvas subgraph={subgraph} centerAccount={accountId} loading={graphLoading} />
+        </div>
+        <div className="hero-side">
+          <ExplanationPanel explanation={explanation} loading={explLoading} />
+        </div>
       </div>
 
-      <Routes>
-        <Route path="/" element={<RiskDashboard />} />
-        <Route path="/topology" element={<NetworkGraphView />} />
-      </Routes>
-    </Router>
+      <div className="lower-row">
+        <div className="lower-main">
+          <h2 className="mono section-title">ranked accounts</h2>
+          <RankedTable accounts={ranked} onSelect={(id) => handleSearch(id)} selectedId={accountId} />
+        </div>
+        <div className="lower-side">
+          <h2 className="mono section-title">pattern deep-dive</h2>
+          <PatternTabs onSelectAccount={(id) => handleSearch(id)} />
+        </div>
+      </div>
+    </div>
   );
 }
-
-export default App;
